@@ -13,26 +13,29 @@ using namespace cv::dnn;
 using namespace std;
 
 // ============================================================================
-// CONFIGURATION
+// CONFIGURATION PARAMETERS
 // ============================================================================
 const string MODEL_PATH       = "/home/admin/train_dms/models/dms_tl.onnx";
 const int CAMERA_SOURCE       = 0; 
-const float  CONF_THRESHOLD   = 0.05f; // Ngưỡng confidence cơ bản
-const float  NMS_THRESHOLD    = 0.45f; // Lọc các khung hình bị trùng
-const int    INPUT_SIZE       = 640;   // Kích thước đầu vào chuẩn của YOLOv8 model này
+const float  CONF_THRESHOLD   = 0.05f; // Base confidence threshold for initial filtering
+const float  NMS_THRESHOLD    = 0.45f; // Non-Maximum Suppression threshold to remove overlapping boxes
+const int    INPUT_SIZE       = 640;   // Standard YOLOv8 input resolution (640x640)
 const string LOG_FILE         = "train_dms_log.txt";
 
-// --- Tối ưu và Logic Cảnh báo ---
-const int PROCESS_EVERY_N_FRAMES  = 3; // Chỉ chạy AI 1 lần mỗi 3 frame (Giảm tải CPU)
+// --- Optimization and Alarm Logic ---
+// Skip frames to dramatically reduce CPU usage (e.g., process 1 out of 3 frames)
+const int PROCESS_EVERY_N_FRAMES  = 3; 
 
-// Số frame liên tiếp để kích hoạt cảnh báo (Debounce logic)
-const int NO_FACE_ALARM_FRAMES    = 10; // ~3.0 giây thực tế
-const int DISTRACTED_ALARM_FRAMES = 7;  // ~2.0 giây thực tế
-const int PHONE_ALARM_FRAMES      = 7;  // ~2.0 giây thực tế
-const int SLEEPY_ALARM_FRAMES     = 5;  // ~1.5 giây thực tế
-const int SMOKING_ALARM_FRAMES    = 5;  // ~1.5 giây thực tế
+// Debounce Logic: Minimum consecutive frames required to trigger an actual alarm.
+// This prevents false positives from single-frame glitches (e.g., normal blinking).
+const int NO_FACE_ALARM_FRAMES    = 10; // Approx. 3.0 seconds of absence
+const int DISTRACTED_ALARM_FRAMES = 7;  // Approx. 2.0 seconds of looking away
+const int PHONE_ALARM_FRAMES      = 7;  // Approx. 2.0 seconds of phone usage
+const int SLEEPY_ALARM_FRAMES     = 5;  // Approx. 1.5 seconds of closed eyes/yawning
+const int SMOKING_ALARM_FRAMES    = 5;  // Approx. 1.5 seconds of smoking
 
-// Danh sách 7 class chuẩn của model Lái Tàu Hỏa (Thứ tự phải khớp 100% file data.yaml)
+// Standardized list of 7 classes for the Train Driver Monitoring model.
+// CRITICAL: The order MUST match the 'names' array in your data.yaml perfectly.
 const vector<string> CLASS_NAMES = {
     "eyeclose", "face", "phone", "yawn", "smoking", "distraction", "drowsy"
 };
@@ -41,27 +44,35 @@ const vector<string> CLASS_NAMES = {
 // HELPER FUNCTIONS
 // ============================================================================
 
-// Thiết lập ngưỡng Confidence riêng cho từng class để chống báo động giả
+/**
+ * @brief Dynamically sets the confidence threshold based on the specific class.
+ * Small or ambiguous objects (like closed eyes) need higher sensitivity (lower threshold),
+ * while distinct objects (like a face) require higher confidence.
+ */
 float getClassThreshold(int class_id) {
     switch (class_id) {
-        case 0: return 0.20f; // eyeclose: Nhỏ, cần điểm nhạy
-        case 1: return 0.30f; // face: Dễ nhận, yêu cầu tự tin cao
-        case 2: return 0.30f; // phone: Vừa phải
-        case 3: return 0.20f; // yawn: Vừa phải
-        case 4: return 0.20f; // smoking: Điếu thuốc nhỏ
-        case 5: return 0.30f; // distraction: Hành vi không tập trung
-        case 6: return 0.25f; // drowsy: Ngủ gật
+        case 0: return 0.20f; // eyeclose: Small target, requires high sensitivity
+        case 1: return 0.30f; // face: Distinct feature, demands higher confidence
+        case 2: return 0.30f; // phone: Medium target
+        case 3: return 0.20f; // yawn: Medium target
+        case 4: return 0.20f; // smoking: Small target (cigarette)
+        case 5: return 0.30f; // distraction: Behavioral state
+        case 6: return 0.25f; // drowsy: Behavioral state
         default: return 0.25f;
     }
 }
 
+// Structure to store parsed detection results
 struct Detection {
     int class_id;
     float confidence;
     Rect box;
 };
 
-// Hàm ghi log ra màn hình và file txt
+/**
+ * @brief Logs alarm events to both the console (stdout) and a persistent text file.
+ * Includes a timestamp for auditing.
+ */
 void logAndPrint(const string& behavior, float conf) {
     auto now = chrono::system_clock::now();
     time_t tt = chrono::system_clock::to_time_t(now);
@@ -69,8 +80,11 @@ void logAndPrint(const string& behavior, float conf) {
     stringstream ss;
     ss << put_time(&local_tm, "%Y-%m-%d %H:%M:%S") << " | EVENT | " << behavior
        << " | conf: " << fixed << setprecision(3) << conf << endl;
+    
     string line = ss.str();
-    cout << line;
+    cout << line; // Print to terminal
+    
+    // Append to log file
     ofstream logfile(LOG_FILE, ios::app);
     if (logfile.is_open()) {
         logfile << line;
@@ -78,7 +92,10 @@ void logAndPrint(const string& behavior, float conf) {
     }
 }
 
-// Thuật toán Letterbox để resize ảnh vuông cho YOLO mà không làm méo tỷ lệ
+/**
+ * @brief Resizes the input image to a square format required by YOLO without distorting the aspect ratio.
+ * It scales the image and adds gray padding (letterboxing) to the remaining areas.
+ */
 Mat letterbox(const Mat& source, int input_size) {
     float scale = min((float)input_size / source.cols, (float)input_size / source.rows);
     int new_w = source.cols * scale;
@@ -87,6 +104,7 @@ Mat letterbox(const Mat& source, int input_size) {
     Mat resized;
     resize(source, resized, Size(new_w, new_h));
 
+    // Calculate padding for centering
     int pad_w = input_size - new_w;
     int pad_h = input_size - new_h;
 
@@ -96,17 +114,23 @@ Mat letterbox(const Mat& source, int input_size) {
     int right = pad_w - left;
 
     Mat result;
+    // Add gray borders (114, 114, 114 is standard for YOLO)
     copyMakeBorder(resized, result, top, bottom, left, right, BORDER_CONSTANT, Scalar(114, 114, 114));
     return result;
 }
 
-// Bóc tách kết quả Tensor của YOLOv8 ra thành tọa độ thực tế
+/**
+ * @brief Parses the raw output tensor from the YOLOv8 ONNX model and converts it into physical bounding boxes.
+ */
 vector<Detection> postprocess(const vector<Mat>& outputs, const Size& frame_size,
                               float conf_thres, float nms_thres) {
     vector<Detection> detections;
     if (outputs.empty()) return detections;
 
     Mat output = outputs[0];
+    
+    // YOLOv8 outputs a 3D tensor [batch_size, channels, features]. 
+    // We flatten and transpose it to a 2D matrix [features, channels] for easier parsing.
     if (output.dims == 3) {
         Mat output2d(output.size[1], output.size[2], CV_32F, output.ptr<float>());
         Mat transposed; 
@@ -114,30 +138,38 @@ vector<Detection> postprocess(const vector<Mat>& outputs, const Size& frame_size
         output = transposed; 
     }
 
+    // Number of classes = total columns - 4 coordinate values (cx, cy, w, h)
     int num_classes = output.cols - 4;
     vector<Rect> boxes;
     vector<float> confidences;
     vector<int> class_ids;
 
+    // Recalculate scaling factors to map coordinates back from 640x640 to original frame size
     float scale = min((float)INPUT_SIZE / frame_size.width, (float)INPUT_SIZE / frame_size.height);
     int pad_w = (INPUT_SIZE - frame_size.width * scale) / 2;
     int pad_h = (INPUT_SIZE - frame_size.height * scale) / 2;
 
+    // Iterate through all predictions
     for (int i = 0; i < output.rows; ++i) {
         Mat row = output.row(i);
         Mat scores = row.colRange(4, 4 + num_classes);
 
         Point class_id_pt;
         double max_class_score;
+        // Find the class with the highest probability
         minMaxLoc(scores, nullptr, &max_class_score, nullptr, &class_id_pt);
 
         float obj_conf = static_cast<float>(max_class_score);
+        
+        // Discard low-confidence predictions using class-specific thresholds
         if (obj_conf > getClassThreshold(class_id_pt.x)) {
+            // YOLO outputs Center X, Center Y, Width, Height
             float cx = row.at<float>(0);
             float cy = row.at<float>(1);
             float w  = row.at<float>(2);
             float h  = row.at<float>(3);
 
+            // Convert center coordinates to top-left corner and remove padding mapping
             int left   = static_cast<int>((cx - w / 2.0f - pad_w) / scale);
             int top    = static_cast<int>((cy - h / 2.0f - pad_h) / scale);
             int width  = static_cast<int>(w / scale);
@@ -149,8 +181,9 @@ vector<Detection> postprocess(const vector<Mat>& outputs, const Size& frame_size
         }
     }
 
+    // Apply Non-Maximum Suppression (NMS) to eliminate redundant, overlapping boxes for the same object
     vector<Rect> nms_boxes;
-    int max_wh = 4096; 
+    int max_wh = 4096; // Offset strategy for multi-class NMS
     for (size_t i = 0; i < boxes.size(); i++) {
         int offset = class_ids[i] * max_wh;
         nms_boxes.push_back(Rect(boxes[i].x + offset, boxes[i].y + offset, boxes[i].width, boxes[i].height));
@@ -159,6 +192,7 @@ vector<Detection> postprocess(const vector<Mat>& outputs, const Size& frame_size
     vector<int> indices;
     dnn::NMSBoxes(nms_boxes, confidences, conf_thres, nms_thres, indices);
 
+    // Save final valid detections
     for (int idx : indices) {
         if (class_ids[idx] >= 0 && class_ids[idx] < static_cast<int>(CLASS_NAMES.size())) {
             detections.push_back({class_ids[idx], confidences[idx], boxes[idx]});
@@ -168,40 +202,45 @@ vector<Detection> postprocess(const vector<Mat>& outputs, const Size& frame_size
 }
 
 // ============================================================================
-// MAIN LOOP
+// MAIN EXECUTION LOOP
 // ============================================================================
 int main() {
     cout << "TrainDMS - Driver Monitoring System starting in Headless Mode..." << endl;
-    cout << "Model: " << MODEL_PATH << endl;
+    cout << "Loading Model: " << MODEL_PATH << endl;
 
+    // Initialize/clear the log file
     ofstream logfile(LOG_FILE, ios::trunc);
     logfile << "=== TrainDMS Log started at " << __DATE__ << " " << __TIME__ << " ===\n";
     logfile.close();
 
+    // Load the ONNX model using OpenCV DNN
     Net net = readNet(MODEL_PATH);
 
+    // Initialize Video Capture (V4L2 backend is optimized for Linux/Debian)
     VideoCapture cap(CAMERA_SOURCE, CAP_V4L2);
     if (!cap.isOpened()) {
-        cerr << "Error: Could not open camera source." << endl;
+        cerr << "CRITICAL ERROR: Could not open camera source." << endl;
         return -1;
     }
 
+    // Retrieve camera properties
     int frame_width = static_cast<int>(cap.get(CAP_PROP_FRAME_WIDTH));
     int frame_height = static_cast<int>(cap.get(CAP_PROP_FRAME_HEIGHT));
     double fps = cap.get(CAP_PROP_FPS);
-    if (fps <= 0.0) fps = 30.0; 
+    if (fps <= 0.0) fps = 30.0; // Fallback FPS if camera fails to report it
 
+    // Setup VideoWriter to save the output locally for reviewing
     string output_video = "dms_output.mp4";
     VideoWriter writer(output_video, VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(frame_width, frame_height));
 
     Mat frame;
     int frame_count = 0;
     
-    // ĐẶT GIỚI HẠN SỐ FRAME ĐỂ CHƯƠNG TRÌNH TỰ ĐỘNG DỪNG VÀ LƯU VIDEO THÀNH CÔNG
-    // 300 frames ~ 10 giây. Bác có thể tăng lên 900 (30 giây) hoặc tùy ý.
+    // Limit execution length. Program will safely terminate and save video after this limit.
+    // 600 frames at 30fps = 20 seconds of recording.
     const int MAX_FRAMES = 600; 
 
-    // Các biến trạng thái đếm khung hình
+    // State machine variables for Debounce Logic
     int consecutive_no_face = 0;    bool is_no_face = false;
     int consecutive_distracted = 0; bool is_distracted = false;
     int consecutive_phone = 0;      bool is_using_phone = false;
@@ -210,25 +249,31 @@ int main() {
 
     vector<Detection> last_detections; 
 
+    // Main frame processing loop
     while (true) {
         if (!cap.read(frame)) break;
         if (frame.empty()) continue;
 
         frame_count++;
 
-        // --- BƯỚC 1: XỬ LÝ AI ---
+        // --- STEP 1: AI INFERENCE ---
+        // Only run the heavy AI inference every N frames to save CPU resources
         if (frame_count % PROCESS_EVERY_N_FRAMES == 0) {
             
+            // Preprocess frame: Letterbox -> Create Blob -> Normalize (1/255.0)
             Mat letterboxed_frame = letterbox(frame, INPUT_SIZE);
             Mat blob = blobFromImage(letterboxed_frame, 1.0 / 255.0, Size(INPUT_SIZE, INPUT_SIZE),
                                      Scalar(0,0,0), true, false);
 
             net.setInput(blob);
             vector<Mat> outputs;
+            // Forward pass (Execute the Neural Network)
             net.forward(outputs, net.getUnconnectedOutLayersNames());
 
+            // Extract bounding boxes
             last_detections = postprocess(outputs, frame.size(), CONF_THRESHOLD, NMS_THRESHOLD);
 
+            // Reset current frame flags
             bool found_driver = false; 
             bool found_distracted = false;
             bool found_phone = false;
@@ -238,25 +283,26 @@ int main() {
             for (const auto& det : last_detections) {
                 const string& behavior = CLASS_NAMES[det.class_id];
                 
-                // Thấy bất kỳ nhãn nào -> Khẳng định có người
+                // If ANY valid class is detected, a driver is present
                 found_driver = true;
 
-                // Phân loại sự kiện
+                // Categorize behaviors
                 if (behavior == "distraction") found_distracted = true;
                 if (behavior == "phone") found_phone = true;
                 if (behavior == "smoking") found_smoking = true;
+                // Group micro-expressions into a general 'Sleepy' state
                 if (behavior == "eyeclose" || behavior == "yawn" || behavior == "drowsy") {
                     found_sleepy = true;
                 }
             }
 
-            // --- BƯỚC 2: LOGIC CẢNH BÁO TÀU HỎA ---
+            // --- STEP 2: TRAIN DRIVER ALARM LOGIC (DEBOUNCE/FILTERING) ---
             
-            // 1. Không có người lái
+            // 2.1 Missing Driver Alarm
             if (!found_driver) {
                 consecutive_no_face++;
                 if (consecutive_no_face >= NO_FACE_ALARM_FRAMES && !is_no_face) {
-                    logAndPrint("ALARM TRIGGERED: NO DRIVER", 1.0);
+                    logAndPrint("ALARM TRIGGERED: NO DRIVER DETECTED", 1.0);
                     is_no_face = true;
                 }
             } else {
@@ -264,11 +310,11 @@ int main() {
                 is_no_face = false;
             }
 
-            // 2. Không tập trung
+            // 2.2 Distraction Alarm
             if (found_distracted) {
                 consecutive_distracted++;
                 if (consecutive_distracted >= DISTRACTED_ALARM_FRAMES && !is_distracted) {
-                    logAndPrint("ALARM TRIGGERED: DISTRACTED", 1.0);
+                    logAndPrint("ALARM TRIGGERED: DRIVER DISTRACTED", 1.0);
                     is_distracted = true;
                 }
             } else {
@@ -276,11 +322,11 @@ int main() {
                 is_distracted = false;
             }
 
-            // 3. Nghe điện thoại
+            // 2.3 Phone Usage Alarm
             if (found_phone) {
                 consecutive_phone++;
                 if (consecutive_phone >= PHONE_ALARM_FRAMES && !is_using_phone) {
-                    logAndPrint("ALARM TRIGGERED: PHONE USAGE", 1.0);
+                    logAndPrint("ALARM TRIGGERED: ILLEGAL PHONE USAGE", 1.0);
                     is_using_phone = true;
                 }
             } else {
@@ -288,11 +334,11 @@ int main() {
                 is_using_phone = false;
             }
 
-            // 4. Buồn ngủ / Ngáp
+            // 2.4 Drowsiness/Fatigue Alarm
             if (found_sleepy) {
                 consecutive_sleepy++;
                 if (consecutive_sleepy >= SLEEPY_ALARM_FRAMES && !is_sleepy) {
-                    logAndPrint("ALARM TRIGGERED: DROWSY/SLEEPING", 1.0);
+                    logAndPrint("ALARM TRIGGERED: CRITICAL - DROWSY/SLEEPING", 1.0);
                     is_sleepy = true;
                 }
             } else {
@@ -300,11 +346,11 @@ int main() {
                 is_sleepy = false;
             }
 
-            // 5. Hút thuốc
+            // 2.5 Smoking Alarm
             if (found_smoking) {
                 consecutive_smoking++;
                 if (consecutive_smoking >= SMOKING_ALARM_FRAMES && !is_smoking) {
-                    logAndPrint("ALARM TRIGGERED: SMOKING", 1.0);
+                    logAndPrint("ALARM TRIGGERED: SMOKING IN CABIN", 1.0);
                     is_smoking = true;
                 }
             } else {
@@ -313,7 +359,8 @@ int main() {
             }
         }
 
-        // --- BƯỚC 3: VẼ KHUNG LÊN VIDEO ĐỂ LƯU LẠI ---
+        // --- STEP 3: RENDER VISUALS (Bounding Boxes & Warning Texts) ---
+        // Render bounding boxes from the last inference pass
         for (const auto& det : last_detections) {
             const string& behavior = CLASS_NAMES[det.class_id];
             rectangle(frame, det.box, Scalar(0, 255, 0), 2);
@@ -322,10 +369,11 @@ int main() {
                     FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
         }
 
-        int y_pos = 50;
+        // Render Warning Texts dynamically based on active alarms
+        int y_pos = 50; // Starting Y coordinate for text
         if (is_no_face) {
             putText(frame, "WARNING: NO DRIVER!!!", Point(30, y_pos), FONT_HERSHEY_SIMPLEX, 1.2, Scalar(0, 0, 255), 3);
-            y_pos += 40;
+            y_pos += 40; // Shift down for next message
         }
         if (is_distracted) {
             putText(frame, "WARNING: DISTRACTED!!!", Point(30, y_pos), FONT_HERSHEY_SIMPLEX, 1.2, Scalar(0, 165, 255), 3);
@@ -343,23 +391,26 @@ int main() {
             putText(frame, "WARNING: SMOKING!!!", Point(30, y_pos), FONT_HERSHEY_SIMPLEX, 1.2, Scalar(0, 255, 255), 3);
         }
 
+        // Save the annotated frame to the output video file
         writer.write(frame);
         
-        // --- BƯỚC 4: THEO DÕI VÀ DỪNG AN TOÀN ---
-        // In log ra Terminal mỗi 30 frame (~ 1 giây) để biết máy đang không bị treo
+        // --- STEP 4: SYSTEM MONITORING ---
+        // Print a heartbeat message every 30 frames (~1 sec) to verify the process hasn't frozen
         if (frame_count % 30 == 0) {
             cout << "Processed " << frame_count << " / " << MAX_FRAMES << " frames..." << endl;
         }
 
-        // Tự động ngắt vòng lặp khi đạt đủ số lượng MAX_FRAMES
+        // Auto-terminate condition for Headless Mode
         if (frame_count >= MAX_FRAMES) {
             break; 
         }
     }
 
-    // --- BƯỚC 5: CLEANUP VÀ XUẤT FILE ---
+    // --- STEP 5: CLEANUP AND EXPORT ---
+    // Safely release hardware resources to prevent memory leaks or corrupted video files
     cap.release();
     writer.release(); 
-    cout << "TrainDMS stopped gracefully. Video saved successfully." << endl;
+    cout << "TrainDMS execution completed safely. Output video saved as " << output_video << endl;
+    
     return 0;
 }
