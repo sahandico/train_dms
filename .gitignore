@@ -1,0 +1,10 @@
+yolo_env/
+models/
+
+*.o
+*.so
+*.a
+
+# File cấu hình của VS Code / Qt
+.vscode/
+*.user
