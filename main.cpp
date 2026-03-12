@@ -37,7 +37,7 @@ const int SMOKING_ALARM_FRAMES    = 5;  // Approx. 1.5 seconds of smoking
 // Standardized list of 7 classes for the Train Driver Monitoring model.
 // CRITICAL: The order MUST match the 'names' array in your data.yaml perfectly.
 const vector<string> CLASS_NAMES = {
-    "eyeclose", "face", "phone", "yawn", "smoking", "distraction", "drowsy"
+    "distraction", "drowsy", "eyeclose", "face", "phone", "smoking", "yawn"
 };
 
 // ============================================================================
@@ -51,13 +51,13 @@ const vector<string> CLASS_NAMES = {
  */
 float getClassThreshold(int class_id) {
     switch (class_id) {
-        case 0: return 0.20f; // eyeclose: Small target, requires high sensitivity
-        case 1: return 0.30f; // face: Distinct feature, demands higher confidence
-        case 2: return 0.30f; // phone: Medium target
-        case 3: return 0.20f; // yawn: Medium target
-        case 4: return 0.20f; // smoking: Small target (cigarette)
-        case 5: return 0.30f; // distraction: Behavioral state
-        case 6: return 0.25f; // drowsy: Behavioral state
+        case 0: return 0.30f; // distraction: Behavioral state
+        case 1: return 0.25f; // drowsy: Behavioral state
+        case 2: return 0.40f; // eyeclose: Small target, requires high sensitivity
+        case 3: return 0.30f; // face: Distinct feature, demands higher confidence
+        case 4: return 0.30f; // phone: Medium target
+        case 5: return 0.20f; // smoking: Small target (cigarette)
+        case 6: return 0.20f; // yawn: Medium target
         default: return 0.25f;
     }
 }
@@ -363,10 +363,10 @@ int main() {
         // Render bounding boxes from the last inference pass
         for (const auto& det : last_detections) {
             const string& behavior = CLASS_NAMES[det.class_id];
-            rectangle(frame, det.box, Scalar(0, 255, 0), 2);
+            rectangle(frame, det.box, Scalar(0, 255, 0), 1);
             string label = behavior + " " + to_string(det.confidence).substr(0, 4);
             putText(frame, label, Point(det.box.x, det.box.y - 10),
-                    FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
+                    FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 1);
         }
 
         // Render Warning Texts dynamically based on active alarms
