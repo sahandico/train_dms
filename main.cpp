@@ -22,9 +22,13 @@ const float  NMS_THRESHOLD    = 0.45f; // Non-Maximum Suppression threshold to r
 const int    INPUT_SIZE       = 640;   // Standard YOLOv8 input resolution (640x640)
 const string LOG_FILE         = "train_dms_log.txt";
 
+// Limit execution length. Program will safely terminate and save video after this limit.
+// 600 frames at 30fps = 20 seconds of recording.
+const int MAX_FRAMES = 900;
+
 // --- Optimization and Alarm Logic ---
 // Skip frames to dramatically reduce CPU usage (e.g., process 1 out of 3 frames)
-const int PROCESS_EVERY_N_FRAMES  = 3; 
+const int PROCESS_EVERY_N_FRAMES  = 3;
 
 // Debounce Logic: Minimum consecutive frames required to trigger an actual alarm.
 // This prevents false positives from single-frame glitches (e.g., normal blinking).
@@ -235,10 +239,6 @@ int main() {
 
     Mat frame;
     int frame_count = 0;
-    
-    // Limit execution length. Program will safely terminate and save video after this limit.
-    // 600 frames at 30fps = 20 seconds of recording.
-    const int MAX_FRAMES = 600; 
 
     // State machine variables for Debounce Logic
     int consecutive_no_face = 0;    bool is_no_face = false;
